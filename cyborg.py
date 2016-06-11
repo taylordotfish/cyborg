@@ -15,9 +15,13 @@
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #
 # This program includes code from pyrcb (https://github.com/taylordotfish/pyrcb).
+# Blocks of code marked "originally from pyrcb" are licensed under the GNU
+# Lesser General Public License, either version 3 of the License, or (at your
+# option) any later version. See "licenses/LGPL-3.0" for a copy of the license.
 """
 Usage:
   cyborg [options] <irc-host> <irc-port> <bot-port> <client-port>
+  cyborg --no-client [options] <irc-host> <irc-port> <bot-port>
   cyborg -h | --help | --version
 
 Options:
@@ -30,17 +34,21 @@ Options:
   --multiple-bots   Allow multiple bots to connect to the bot proxy server.
   --forward-client  Forward bots PRIVMSGs and NOTICEs sent by the client.
   --ipv6            Use IPv6 for the bot and client proxy servers.
+  --ssl             Use SSL/TLS when connecting to the IRC server.
+  --no-client       Don't use an IRC client; manage only bots instead. You do
+                    not need to provide <client-port> when using this option.
 """
 from docopt import docopt
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
 from getpass import getpass
 from threading import Event, Thread
 import re
 import selectors
 import socket
+import ssl
 import sys
 
-__version__ = "0.1.1"
+__version__ = "0.2.0"
 
 # Update this link if you make any modifications.
 SOURCE = "https://github.com/taylordotfish/cyborg"
@@ -52,6 +60,7 @@ class Bot:
         self.identified = False
         self.user = False
         self.nick = False
+        self.is_first = False
 
     def send_line(self, line):
         send_line(self.socket, line)
@@ -63,46 +72,62 @@ class Bot:
 
 class Cyborg:
     def __init__(self, password=None, global_bot=False, global_client=False,
-                 multiple_bots=False, forward_client=False, ipv6=False):
+                 multiple_bots=False, forward_client=False, ipv6=False,
+                 no_client=False):
         self.password = password
         self.global_bot = global_bot
         self.global_client = global_client
         self.multiple_bots = multiple_bots
         self.forward_client = forward_client
         self.family = socket.AF_INET6 if ipv6 else socket.AF_INET
+        self.no_client = no_client
 
         self.nickname = None
-        self.bots = {}
+        self.bots = OrderedDict()
 
         self.accept_bot = Event()
         self.bot_server_thread = None
         self.selector = selectors.DefaultSelector()
         self._buffers = defaultdict(str)
         self._shutdown = False
+        self._first_bot = True
 
         self.bot_port = None
         self.client_port = None
         self.client_sock = None
         self.server_sock = None
 
-    def start(self, bot_port, client_port, irc_host, irc_port):
-        self.bot_port, self.client_port = bot_port, client_port
-        client_serv = socket.socket(family=self.family)
-        client_serv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        client_host = "" if self.global_client else "localhost"
-        client_serv.bind((client_host, client_port))
-        client_serv.listen()
+    def start(self, bot_port, client_port, irc_host, irc_port, use_ssl=False):
+        self.bot_port = bot_port
+        self.client_port = client_port
 
-        # Accept client socket.
-        self.client_sock, addr = client_serv.accept()
-        self.send_client(":* NOTICE * :Cyborg v{0}".format(__version__))
-        self.send_client(":* NOTICE * :Source: {0}".format(SOURCE))
-        close_socket(client_serv)
+        def accept_client():
+            client_serv = socket.socket(family=self.family)
+            client_serv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            client_host = "" if self.global_client else "localhost"
+            client_serv.bind((client_host, client_port))
+            client_serv.listen()
+
+            # Accept client socket.
+            self.client_sock, addr = client_serv.accept()
+            self.send_client(":* NOTICE * :Cyborg v{0}".format(__version__))
+            self.send_client(":* NOTICE * :Source: {0}".format(SOURCE))
+            close_socket(client_serv)
+
+        if self.no_client:
+            # Accept one bot.
+            self.start_bot_server(bot_port, loop=False)
+        else:
+            accept_client()
 
         # Connect to IRC server.
         self.server_sock = socket.create_connection((irc_host, irc_port))
-        self.selector.register(self.client_sock, selectors.EVENT_READ)
+        if use_ssl:
+            self.server_sock = wrap_socket(self.server_sock, irc_host)
+
         self.selector.register(self.server_sock, selectors.EVENT_READ)
+        if not self.no_client:
+            self.selector.register(self.client_sock, selectors.EVENT_READ)
 
         while self.nickname is None:
             if not self.handle_lines():
@@ -110,14 +135,18 @@ class Cyborg:
 
         # Start bot proxy server.
         bot_thread = Thread(target=self.start_bot_server, args=[bot_port])
-        bot_thread.start()
         self.bot_server_thread = bot_thread
+        bot_thread.start()
 
         while True:
             if not self.handle_lines():
                 return
 
-    def start_bot_server(self, port):
+    def start_bot_server(self, port, loop=True):
+        if not self.multiple_bots and self.bots:
+            self.accept_bot.wait()
+            self.accept_bot.clear()
+
         serv = None
         while not self._shutdown:
             if serv is None:
@@ -134,10 +163,19 @@ class Cyborg:
                 bot.close()
                 return
 
+            if self._first_bot:
+                bot.is_first = True
+                self._first_bot = False
+
             self.bots[bot_sock] = bot
             bot.send_line(":* NOTICE * :Cyborg v{0}".format(__version__))
             bot.send_line(":* NOTICE * :Source: {0}".format(SOURCE))
             self.selector.register(bot.socket, selectors.EVENT_READ)
+
+            if not loop:
+                close_socket(serv)
+                return
+
             if not self.multiple_bots:
                 close_socket(serv)
                 serv = None
@@ -146,7 +184,7 @@ class Cyborg:
 
     def send_bots(self, line):
         for bot in self.bots.values():
-            if bot.user and bot.nick:
+            if (bot.user and bot.nick) or bot.is_first:
                 bot.send_line(line)
 
     def send_client(self, line):
@@ -205,7 +243,7 @@ class Cyborg:
 
         # Ignore the expected USER and NICK messages
         # when the bot first connects.
-        if not (bot.user and bot.nick):
+        if not (bot.user and bot.nick) and not bot.is_first:
             print("[bot]", line)
             if cmd == "USER":
                 bot.user = True
@@ -217,10 +255,11 @@ class Cyborg:
                 bot.send_line(message)
             return
 
-        if cmd in ["PRIVMSG", "NOTICE"] and self.nickname:
-            prefix = ":" + self.nickname + " "
-            print("[bot -> client]", prefix + line)
-            self.send_client(prefix + line)
+        if not self.no_client:
+            if cmd in ["PRIVMSG", "NOTICE"] and self.nickname:
+                prefix = ":" + self.nickname + " "
+                print("[bot -> client]", prefix + line)
+                self.send_client(prefix + line)
         print("[bot -> server]", line)
         self.send_server(line)
 
@@ -242,12 +281,20 @@ class Cyborg:
         cmd = cmd.upper()
         if cmd == "PING":
             print("[server]", line)
+            response = irc_format("PONG", args)
+            print("[-> server]", response)
+            self.send_server(response)
             return
+
         is_self = (self.nickname and nick.lower() == self.nickname.lower())
         if cmd == "001" or (cmd == "NICK" and is_self):
             self.nickname = args[0]
-        print("[server -> client, bot]", line)
-        self.send_client(line)
+
+        if self.no_client:
+            print("[server -> bot]", line)
+        else:
+            print("[server -> client, bot]", line)
+            self.send_client(line)
         self.send_bots(line)
 
     def handle_disconnect(self, sock):
@@ -344,6 +391,30 @@ def irc_format(command, args=[]):
     return " ".join([command] + args)
 
 
+# (Originally from pyrcb.)
+# Wraps a plain socket into an SSL one. Attempts to load default CA
+# certificates if none are provided. Verifies the server's certificate and
+# hostname if specified.
+def wrap_socket(sock, hostname=None, ca_certs=None, verify_ssl=True):
+    context = ssl.SSLContext(ssl.PROTOCOL_SSLv23)
+    # Use load_default_certs() if available (Python >= 3.4); otherwise, use
+    # set_default_verify_paths() (doesn't work on Windows).
+    load_default_certs = getattr(
+        context, "load_default_certs", context.set_default_verify_paths)
+
+    if verify_ssl:
+        context.verify_mode = ssl.CERT_REQUIRED
+    if ca_certs:
+        context.load_verify_locations(cafile=ca_certs)
+    else:
+        load_default_certs()
+
+    sock = context.wrap_socket(sock)
+    if verify_ssl:
+        ssl.match_hostname(sock.getpeercert(), hostname)
+    return sock
+
+
 def main(argv):
     args = docopt(__doc__, argv=argv[1:], version=__version__)
     password = None
@@ -355,12 +426,14 @@ def main(argv):
 
     cyborg = Cyborg(
         password, args["--global-bot"], args["--global-client"],
-        args["--multiple-bots"], args["--forward-client"], args["--ipv6"])
+        args["--multiple-bots"], args["--forward-client"], args["--ipv6"],
+        args["--no-client"])
 
+    client_port = None if args["--no-client"] else int(args["<client-port>"])
     try:
         cyborg.start(
-            int(args["<bot-port>"]), int(args["<client-port>"]),
-            args["<irc-host>"], int(args["<irc-port>"]))
+            int(args["<bot-port>"]), client_port, args["<irc-host>"],
+            int(args["<irc-port>"]), args["--ssl"])
     except KeyboardInterrupt:
         cyborg.shutdown()
 
