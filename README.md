@@ -1,7 +1,7 @@
 cyborg
 ======
 
-Version 0.1.1
+Version 0.2.0
 
 **cyborg** allows you to run IRC bots on your personal IRC account. You and
 your bots can send messages using the same nickname. When you start cyborg, it
@@ -34,6 +34,16 @@ connection to the IRC server is lost.
 \* If you're using the options ``--global-bot`` or ``--global-client``, the
 respective proxy servers will run on all interfaces, so you can connect from a
 computer other than the one cyborg is running on.
+
+What's new
+----------
+
+Version 0.2.0:
+
+* Added option ``--no-client``, which allows you to use cyborg as a proxy
+  server for bots only.
+* Added SSL/TLS support when connecting to IRC servers (option ``--ssl``)
+* Fixed a bug where cyborg would not respond to server ``PING`` messages.
 
 Dependencies
 ------------
