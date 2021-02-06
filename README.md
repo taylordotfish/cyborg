@@ -48,5 +48,11 @@ Version 0.2.0:
 Dependencies
 ------------
 
-* Python 3.3 or higher
-* [docopt 0.6.6 or higher](https://pypi.python.org/pypi/docopt)
+* Python ≥ 3.3
+* Python package: [docopt]
+
+Run ``pip3 install -r requirements.txt`` to install the Python packages. You
+can also use ``requirements.freeze.txt`` instead to install specific versions
+of the dependencies that have been verified to work.
+
+[docopt]: https://pypi.org/project/docopt
